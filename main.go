@@ -30,6 +30,7 @@ func run() error {
 		version    = flag.String("version", "1.0", "app version")
 		identifier = flag.String("id", "", "bundle identifier")
 		icon       = flag.String("icon", "", "icon image file (.icns|.png|.jpg|.jpeg)")
+		mode       = flag.String("mode", "normal", "mode (normal,tray)")
 	)
 	flag.Parse()
 	args := flag.Args()
@@ -78,6 +79,7 @@ func run() error {
 		Version:            *version,
 		InfoString:         *name + " by " + *author,
 		ShortVersionString: *version,
+		Mode:               *mode,
 	}
 	if *icon != "" {
 		iconPath, err := prepareIcons(*icon, resouresPath)
@@ -151,6 +153,7 @@ type infoListData struct {
 	InfoString         string
 	ShortVersionString string
 	IconFile           string
+	Mode               string
 }
 
 const infoPlistTemplate = `<?xml version="1.0" encoding="UTF-8"?>
@@ -176,6 +179,12 @@ const infoPlistTemplate = `<?xml version="1.0" encoding="UTF-8"?>
 		{{ if .IconFile -}}
 		<key>CFBundleIconFile</key>
 		<string>{{ .IconFile }}</string>
+		{{- end }}
+		<key>NSHighResolutionCapable</key>
+		<true/>
+		{{ if eq .Mode "tray" -}}
+		<key>LSUIElement</key>
+		<true/>
 		{{- end }}
 	</dict>
 </plist>
