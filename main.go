@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"flag"
 	"fmt"
 	"image"
 	"io"
 	"io/ioutil"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -38,11 +40,13 @@ func run() error {
 		return errors.New("missing executable argument")
 	}
 	bin := args[0]
-	appname := *name + ".app"
-	contentsPath := filepath.Join(appname, "Contents")
+	appName := *name + ".app"
+
+	contentsPath := filepath.Join(appName, "Contents")
 	appPath := filepath.Join(contentsPath, "MacOS")
-	resouresPath := filepath.Join(contentsPath, "Resources")
-	binPath := filepath.Join(appPath, appname)
+	resourcesPath := filepath.Join(contentsPath, "Resources")
+	binPath := filepath.Join(appPath, appName)
+
 	if err := os.MkdirAll(appPath, 0777); err != nil {
 		return errors.Wrap(err, "os.MkdirAll appPath")
 	}
@@ -74,7 +78,7 @@ func run() error {
 	}
 	info := infoListData{
 		Name:               *name,
-		Executable:         filepath.Join("MacOS", appname),
+		Executable:         filepath.Join("MacOS", appName),
 		Identifier:         id,
 		Version:            *version,
 		InfoString:         *name + " by " + *author,
@@ -82,7 +86,7 @@ func run() error {
 		Mode:               *mode,
 	}
 	if *icon != "" {
-		iconPath, err := prepareIcons(*icon, resouresPath)
+		iconPath, err := prepareIcons(*icon, resourcesPath)
 		if err != nil {
 			return errors.Wrap(err, "icon")
 		}
@@ -103,7 +107,8 @@ func run() error {
 	if err := ioutil.WriteFile(filepath.Join(contentsPath, "README"), []byte(readme), 0666); err != nil {
 		return errors.Wrap(err, "ioutil.WriteFile")
 	}
-	return nil
+
+	return buildDMG(*name, appName)
 }
 
 func prepareIcons(iconPath, resourcesPath string) (string, error) {
@@ -143,6 +148,193 @@ func prepareIcons(iconPath, resourcesPath string) (string, error) {
 		return destFile, errors.New(ext + " icons not supported")
 	}
 	return destFile, nil
+}
+
+func buildDMG(appName, appDir string) error {
+	dmg := makeTemplateDMG()
+	return buildDMGFromTemplate(appName, dmg, appDir)
+}
+
+func makeTemplateDMG() string {
+	templateDMG := "template"
+
+	err := os.Mkdir("tmp", os.ModePerm)
+	if err != nil {
+		println("mkdir tmp dir error")
+		os.Exit(-1)
+	}
+	defer os.Remove("./tmp")
+
+	// create the template dmg
+	cmd := exec.Command("hdiutil",
+		"create",
+		"-fs", "HFSX",
+		"-layout", "SPUD",
+		"-size", "10m",
+		templateDMG,
+		"-srcfolder", "tmp",
+		"-format", "UDRW",
+		//"-volname tmp",
+		"-quiet",
+	)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	err = cmd.Run()
+	if err != nil {
+		fmt.Println("create dmg file error:", err.Error())
+		os.Exit(-1)
+	}
+	return templateDMG + ".dmg"
+}
+
+// copy from https://gist.github.com/mholt/11008646c95d787c30806d3f24b2c844
+func buildDMGFromTemplate(appName, templateDMG, appDir string) error {
+
+	tmpDir := "./tmp"
+	err := os.Mkdir(tmpDir, 0755)
+	if err != nil {
+		return fmt.Errorf("making temporary directory: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// attach the template dmg
+	cmd := exec.Command("hdiutil", "attach", templateDMG, "-noautoopen", "-mountpoint", tmpDir)
+	attachBuf := new(bytes.Buffer)
+	cmd.Stdout = attachBuf
+	cmd.Stderr = os.Stderr
+	err = cmd.Run()
+	if err != nil {
+		return fmt.Errorf("running hdiutil attach: %v", err)
+	}
+
+	err = deepCopy(appDir, tmpDir)
+	if err != nil {
+		return fmt.Errorf("copying app into dmg: %v", err)
+	}
+
+	// get attached image's device; it should be the
+	// first device that is outputted
+	hdiutilOutFields := strings.Fields(attachBuf.String())
+	if len(hdiutilOutFields) == 0 {
+		return fmt.Errorf("no device output by hdiutil attach")
+	}
+	dmgDevice := hdiutilOutFields[0]
+
+	// detach image
+	cmd = exec.Command("hdiutil", "detach", dmgDevice)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	err = cmd.Run()
+	if err != nil {
+		return fmt.Errorf("running hdiutil detach: %v", err)
+	}
+
+	// convert to compressed image
+	outputDMG := appName + ".dmg"
+	cmd = exec.Command("hdiutil", "convert", templateDMG, "-format", "UDZO", "-imagekey", "zlib-level=9", "-o", outputDMG)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	err = cmd.Run()
+	if err != nil {
+		return fmt.Errorf("running hdiutil convert: %v", err)
+	}
+
+	return nil
+}
+
+// deepCopy makes a deep copy of from into to.
+func deepCopy(from, to string) error {
+	if from == "" || to == "" {
+		return fmt.Errorf("no source or no destination; both required")
+	}
+
+	// traverse the source directory and copy each file
+	return filepath.Walk(from, func(path string, info os.FileInfo, err error) error {
+		// error accessing current file
+		if err != nil {
+			return err
+		}
+
+		// skip files/folders without a name
+		if info.Name() == "" {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		// if directory, create destination directory (if not
+		// already created by our pre-walk)
+		if info.IsDir() {
+			subdir := strings.TrimPrefix(path, filepath.Dir(from))
+			destDir := filepath.Join(to, subdir)
+			if _, err := os.Stat(destDir); os.IsNotExist(err) {
+				err := os.Mkdir(destDir, info.Mode()&os.ModePerm)
+				if err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+
+		destPath := filepath.Join(to, strings.TrimPrefix(path, filepath.Dir(from)))
+		err = copyFile(path, destPath, info)
+		if err != nil {
+			return fmt.Errorf("copying file %s: %v", path, err)
+		}
+		return nil
+	})
+}
+
+func copyFile(from, to string, fromInfo os.FileInfo) error {
+	log.Printf("[INFO] Copying %s to %s", from, to)
+
+	if fromInfo == nil {
+		var err error
+		fromInfo, err = os.Stat(from)
+		if err != nil {
+			return err
+		}
+	}
+
+	// open source file
+	fsrc, err := os.Open(from)
+	if err != nil {
+		return err
+	}
+
+	// create destination file, with identical permissions
+	fdest, err := os.OpenFile(to, os.O_RDWR|os.O_CREATE|os.O_TRUNC, fromInfo.Mode()&os.ModePerm)
+	if err != nil {
+		fsrc.Close()
+		if _, err2 := os.Stat(to); err2 == nil {
+			return fmt.Errorf("opening destination (which already exists): %v", err)
+		}
+		return err
+	}
+
+	// copy the file and ensure it gets flushed to disk
+	if _, err = io.Copy(fdest, fsrc); err != nil {
+		fsrc.Close()
+		fdest.Close()
+		return err
+	}
+	if err = fdest.Sync(); err != nil {
+		fsrc.Close()
+		fdest.Close()
+		return err
+	}
+
+	// close both files
+	if err = fsrc.Close(); err != nil {
+		fdest.Close()
+		return err
+	}
+	if err = fdest.Close(); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 type infoListData struct {
